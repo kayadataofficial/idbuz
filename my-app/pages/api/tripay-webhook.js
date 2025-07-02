@@ -1,5 +1,3 @@
-// pages/api/create-invoice.js
-import crypto from 'crypto'
 import { supabase } from '@/lib/supabase'
 
 export default async function handler(req, res) {
@@ -8,76 +6,67 @@ export default async function handler(req, res) {
   }
 
   try {
-    const { service, quantity, link } = req.body
+    const { status, merchant_ref } = req.body
+    console.log('[WEBHOOK TRIPAY]', { status, merchant_ref })
 
-    const pricePerUnit = 72000
-    const amount = quantity * pricePerUnit
-    const merchant_ref = `INV-${Date.now()}`
-    const tripayApiKey = process.env.TRIPAY_API_KEY
-    const privateKey = process.env.TRIPAY_PRIVATE_KEY
-    const merchantCode = process.env.TRIPAY_MERCHANT_CODE
-
-    const payload = {
-      method: 'QRIS',
-      merchant_ref,
-      amount,
-      customer_name: 'SMM Customer',
-      customer_email: 'user@example.com',
-      order_items: [
-        {
-          sku: service.toString(),
-          name: 'SMM Service',
-          price: pricePerUnit,
-          quantity,
-        },
-      ],
-      return_url: 'https://idbuz-kayadatas-projects.vercel.app/success',
-      callback_url: 'https://idbuz-kayadatas-projects.vercel.app/api/tripay-webhook',
+    if (status !== 'PAID') {
+      return res.status(200).json({ message: 'Status bukan PAID, dilewati' })
     }
 
-    const stringToSign = merchantCode + merchant_ref + amount + privateKey
-    payload.signature = crypto.createHash('sha256').update(stringToSign).digest('hex')
-
-    console.log('[INVOICE PAYLOAD]', payload)
-
-    const tripayRes = await fetch('https://tripay.co.id/api-sandbox/transaction/create', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${tripayApiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(payload),
-    })
-
-    const tripayData = await tripayRes.json()
-    console.log('[TRIPAY RESPONSE]', tripayData)
-
-    if (!tripayData.success) {
-      return res.status(500).json({ error: 'Gagal membuat invoice', tripayData })
-    }
-
-    // Simpan ke Supabase
-    const { error: insertError } = await supabase
+    // Ambil order dari Supabase
+    const { data: orderData, error: fetchError } = await supabase
       .from('order')
-      .insert({
-        merchant_ref,
-        service,
-        link,
-        quantity,
-        status: 'pending',
-      })
+      .select('*')
+      .eq('merchant_ref', merchant_ref)
+      .single()
 
-    if (insertError) {
-      console.error('[SUPABASE ERROR]', insertError)
-      return res.status(500).json({ error: 'Gagal menyimpan ke Supabase' })
+    if (fetchError || !orderData) {
+      console.error('[SUPABASE ERROR] Gagal ambil order:', fetchError)
+      return res.status(500).json({ error: 'Gagal ambil data order' })
     }
 
-    return res.status(200).json({
-      checkout_url: tripayData.data.checkout_url,
-      merchant_ref,
+    // Submit ke IndoSMM
+    const indoPayload = {
+      key: process.env.INDOSMM_API_KEY,
+      action: 'add',
+      service: orderData.service,
+      link: orderData.link,
+      quantity: orderData.quantity
+    }
+
+    console.log('[INDOSMM PAYLOAD]', indoPayload)
+
+    const indoRes = await fetch('https://indosmm.id/api/v2', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(indoPayload)
     })
-  } catch (err) {
-    console.error('[SERVER ERROR]', err)
-    return res.status(500).json({ error: 'Terjadi kesalahan server' })
+
+    const indoResult = await indoRes.json()
+    console.log('[INDOSMM ORDER RESULT]', indoResult)
+
+    if (!indoResult.order) {
+      console.error('[INDOSMM ERROR]', indoResult)
+      return res.status(500).json({ error: 'Gagal order ke IndoSMM' })
+    }
+
+    // Update Supabase
+    const { error: updateError } = await supabase
+      .from('order')
+      .update({
+        status: 'paid',
+        indo_order_id: indoResult.order.toString()
+      })
+      .eq('merchant_ref', merchant_ref)
+
+    if (updateError) {
+      console.error('[SUPABASE UPDATE ERROR]', updateError)
+      return res.status(500).json({ error: 'Gagal update status order' })
+    }
+
+    return res.status(200).json({ success: true })
+  } catch (error) {
+    console.error('[FATAL ERROR]', error)
+    return res.status(500).json({ error: 'Server Error' })
   }
 }
