@@ -1,3 +1,5 @@
+// pages/api/create-invoice.js
+import crypto from 'crypto'
 import { supabase } from '@/lib/supabase'
 
 export default async function handler(req, res) {
@@ -6,67 +8,76 @@ export default async function handler(req, res) {
   }
 
   try {
-    const { status, merchant_ref } = req.body
-    console.log('[WEBHOOK TRIPAY]', { status, merchant_ref })
+    const { service, quantity, link } = req.body
 
-    if (status !== 'PAID') {
-      return res.status(200).json({ message: 'Status bukan PAID, dilewati' })
+    const pricePerUnit = 72000
+    const amount = quantity * pricePerUnit
+    const merchant_ref = `INV-${Date.now()}`
+    const tripayApiKey = process.env.TRIPAY_API_KEY
+    const privateKey = process.env.TRIPAY_PRIVATE_KEY
+    const merchantCode = process.env.TRIPAY_MERCHANT_CODE
+
+    const payload = {
+      method: 'QRIS',
+      merchant_ref,
+      amount,
+      customer_name: 'SMM Customer',
+      customer_email: 'user@example.com',
+      order_items: [
+        {
+          sku: service.toString(),
+          name: 'SMM Service',
+          price: pricePerUnit,
+          quantity,
+        },
+      ],
+      return_url: 'https://idbuz-kayadatas-projects.vercel.app/success',
+      callback_url: 'https://idbuz-kayadatas-projects.vercel.app/api/tripay-webhook',
     }
 
-    // Ambil order dari Supabase
-    const { data: orderData, error: fetchError } = await supabase
-      .from('order')
-      .select('*')
-      .eq('merchant_ref', merchant_ref)
-      .single()
+    const stringToSign = merchantCode + merchant_ref + amount + privateKey
+    payload.signature = crypto.createHash('sha256').update(stringToSign).digest('hex')
 
-    if (fetchError || !orderData) {
-      console.error('[SUPABASE ERROR] Gagal ambil order:', fetchError)
-      return res.status(500).json({ error: 'Gagal ambil data order' })
-    }
+    console.log('[INVOICE PAYLOAD]', payload)
 
-    // Submit ke IndoSMM
-    const indoPayload = {
-      key: process.env.INDOSMM_API_KEY,
-      action: 'add',
-      service: orderData.service,
-      link: orderData.link,
-      quantity: orderData.quantity
-    }
-
-    console.log('[INDOSMM PAYLOAD]', indoPayload)
-
-    const indoRes = await fetch('https://indosmm.id/api/v2', {
+    const tripayRes = await fetch('https://tripay.co.id/api-sandbox/transaction/create', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(indoPayload)
+      headers: {
+        'Authorization': `Bearer ${tripayApiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(payload),
     })
 
-    const indoResult = await indoRes.json()
-    console.log('[INDOSMM ORDER RESULT]', indoResult)
+    const tripayData = await tripayRes.json()
+    console.log('[TRIPAY RESPONSE]', tripayData)
 
-    if (!indoResult.order) {
-      console.error('[INDOSMM ERROR]', indoResult)
-      return res.status(500).json({ error: 'Gagal order ke IndoSMM' })
+    if (!tripayData.success) {
+      return res.status(500).json({ error: 'Gagal membuat invoice', tripayData })
     }
 
-    // Update Supabase
-    const { error: updateError } = await supabase
+    // Simpan ke Supabase
+    const { error: insertError } = await supabase
       .from('order')
-      .update({
-        status: 'paid',
-        indo_order_id: indoResult.order.toString()
+      .insert({
+        merchant_ref,
+        service,
+        link,
+        quantity,
+        status: 'pending',
       })
-      .eq('merchant_ref', merchant_ref)
 
-    if (updateError) {
-      console.error('[SUPABASE UPDATE ERROR]', updateError)
-      return res.status(500).json({ error: 'Gagal update status order' })
+    if (insertError) {
+      console.error('[SUPABASE ERROR]', insertError)
+      return res.status(500).json({ error: 'Gagal menyimpan ke Supabase' })
     }
 
-    return res.status(200).json({ success: true })
-  } catch (error) {
-    console.error('[FATAL ERROR]', error)
-    return res.status(500).json({ error: 'Server Error' })
+    return res.status(200).json({
+      checkout_url: tripayData.data.checkout_url,
+      merchant_ref,
+    })
+  } catch (err) {
+    console.error('[SERVER ERROR]', err)
+    return res.status(500).json({ error: 'Terjadi kesalahan server' })
   }
 }
